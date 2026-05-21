@@ -1,6 +1,7 @@
 """Home Assistant API client for interacting with the REST API."""
 
 import asyncio
+import json
 import logging
 import time
 from typing import Any
@@ -17,6 +18,13 @@ from .cache import StateCache
 from .performance import get_performance_monitor
 
 logger = logging.getLogger(__name__)
+
+_ALLOWED_SERVICE_DOMAINS = frozenset({
+    "switch", "input_number", "fan", "media_player", "light",
+    "input_button", "input_boolean", "input_datetime", "input_select",
+    "input_text", "alert", "number", "select", "cover", "climate",
+    "vacuum", "webostv", "humidifier", "lock", "siren", "automation",
+})
 
 
 class HomeAssistantClient:
@@ -296,8 +304,11 @@ class HomeAssistantClient:
                 response = await self.client.get("/services")
                 response.raise_for_status()
 
-            services = response.json()
-            logger.debug(f"Retrieved services for {len(services)} domains")
+            services = [
+                s for s in response.json()
+                if s.get("domain") in _ALLOWED_SERVICE_DOMAINS
+            ]
+            logger.debug(f"Retrieved services for {len(services)} allowed domains")
 
             success = True
             return services  # type: ignore[no-any-return]
@@ -387,7 +398,7 @@ class HomeAssistantClient:
         self,
         domain: str | None = None,
         area: str | None = None,
-        limit: int | None = None,
+        limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Get all entity states from Home Assistant with filtering and caching.
 
@@ -397,8 +408,7 @@ class HomeAssistantClient:
         Args:
             domain: Optional domain filter (e.g., "light", "switch")
             area: Optional area filter (e.g., "Living Room")
-            limit: Maximum number of entities to return. Defaults to None (no limit)
-                   when domain or area filter is provided, or 500 when unfiltered.
+            limit: Maximum number of entities to return (default 100, max 500)
 
         Returns:
             List of entity state dictionaries, each containing:
@@ -425,15 +435,31 @@ class HomeAssistantClient:
             success = False
 
             try:
+                # Fetch the set of entity IDs that carry the MCPServer label
+                logger.debug("Fetching MCPServer-labeled entity IDs via template")
+                async with self._semaphore:
+                    template_response = await self.client.post(
+                        "/template",
+                        json={"template": "{{ label_entities('MCPServer') | list | tojson }}"},
+                    )
+                    template_response.raise_for_status()
+
+                allowed_entity_ids = set(json.loads(template_response.text))
+                logger.debug(f"Found {len(allowed_entity_ids)} MCPServer-labeled entities")
+
+                # Fetch all states then keep only the allowed ones
                 logger.debug("Fetching all entity states from API")
                 async with self._semaphore:
                     response = await self.client.get("/states")
                     response.raise_for_status()
 
-                all_states = response.json()
-                logger.debug(f"Retrieved {len(all_states)} entity states from API")
+                all_states = [
+                    state for state in response.json()
+                    if state.get("entity_id") in allowed_entity_ids
+                ]
+                logger.debug(f"Filtered to {len(all_states)} MCPServer-labeled entity states")
 
-                # Cache the results
+                # Cache the filtered results
                 self.cache.set(cache_key, all_states, self.cache_ttl_states)
 
                 success = True
@@ -481,19 +507,14 @@ class HomeAssistantClient:
             ]
             logger.debug(f"Filtered to {len(filtered_states)} entities in area '{area}'")
 
-        # Apply limit — default to no limit when filtered, 500 when unfiltered
-        has_filter = domain is not None or area is not None
-        if limit is None:
-            effective_limit = None if has_filter else 500
-        else:
-            effective_limit = min(limit, 500)
-
-        if effective_limit and len(filtered_states) > effective_limit:
+        # Apply limit (max 500)
+        limit = min(limit, 500)
+        if len(filtered_states) > limit:
             logger.warning(
                 f"Response truncated: {len(filtered_states)} entities found, "
-                f"returning first {effective_limit}. Use more specific filters to see all results."
+                f"returning first {limit}. Use more specific filters to see all results."
             )
-            filtered_states = filtered_states[:effective_limit]
+            filtered_states = filtered_states[:limit]
 
         # Track response size
         import sys
@@ -664,6 +685,9 @@ class HomeAssistantClient:
             ConnectionError: If connection to Home Assistant fails
             ServiceCallError: If the API returns an error
         """
+        # Don't allow delete
+        return {"message": "State not deleted"}
+
         start_time = time.time()
         success = False
 
@@ -1378,6 +1402,11 @@ class HomeAssistantClient:
         success = False
 
         try:
+            if domain not in _ALLOWED_SERVICE_DOMAINS:
+                raise ServiceCallError(
+                    f"Service domain '{domain}' is not permitted by this MCP server"
+                )
+
             endpoint = f"/services/{domain}/{service}"
             payload = data or {}
 
