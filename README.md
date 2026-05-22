@@ -1,3 +1,6 @@
+!! Whats different from original version: /states only shows entities that have label MCPServer set and only some domain tools may be allowed. 
+!! All changes in /src/hass/client.py
+
 # Home Assistant MCP Server
 
 A Model Context Protocol (MCP) server that lets AI assistants control Home Assistant. Built with Python and [FastMCP](https://github.com/jlowin/fastmcp).
