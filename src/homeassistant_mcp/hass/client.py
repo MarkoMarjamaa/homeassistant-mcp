@@ -19,12 +19,72 @@ from .performance import get_performance_monitor
 
 logger = logging.getLogger(__name__)
 
+# Permissions
+_MCP_LABEL = "MCPServer"
+_ALLOW_STATE_DELETE = False
+
 _ALLOWED_SERVICE_DOMAINS = frozenset({
-    "switch", "input_number", "fan", "media_player", "light",
-    "input_button", "input_boolean", "input_datetime", "input_select",
-    "input_text", "alert", "number", "select", "cover", "climate",
-    "vacuum", "webostv", "humidifier", "lock", "siren", "automation",
+    #"persistent_notification",
+    #"homeassistant",
+    #"system_log",
+    #"logger",
+    #"frontend",
+    #"recorder",
+    #"group",
+    "switch",
+    #"scene",
+    #"script",
+    #"logbook",
+    #"zone",
+    #"backup",
+    "input_number",
+    #"person",
+    "fan",
+    "media_player",
+    "light",
+    #"notify",
+    #"smtp",
+    #"schedule",
+    #"command_line",
+    #"mqtt",
+    #"shell_command",
+    "input_button",
+    "input_boolean",
+    #"sql",
+    "input_select",
+    #"counter",
+    #"rest",
+    #"timer",
+    "input_datetime",
+    #"wake_on_lan",
+    "input_text",
+    #"zwave_js",
+    #"conversation",
+    "alert",
+    "number",
+    "select",
+    #"derivative",
+    #"button",
+    #"squeezebox",
+    #"update",
+    #"camera",
+    #"local_file",
+    #"ffmpeg",
+    "cover",
+    "climate",
+    "vacuum",
+    "webostv",
+    "humidifier",
+    "lock",
+    "siren",
+    #"template",
+    "automation",
+    #"frigate",
+    #"image",
+    #"weather",
 })
+
+
 
 
 class HomeAssistantClient:
@@ -398,7 +458,7 @@ class HomeAssistantClient:
         self,
         domain: str | None = None,
         area: str | None = None,
-        limit: int = 100,
+        limit: int = 500,
     ) -> list[dict[str, Any]]:
         """Get all entity states from Home Assistant with filtering and caching.
 
@@ -435,29 +495,36 @@ class HomeAssistantClient:
             success = False
 
             try:
-                # Fetch the set of entity IDs that carry the MCPServer label
-                logger.debug("Fetching MCPServer-labeled entity IDs via template")
-                async with self._semaphore:
-                    template_response = await self.client.post(
-                        "/template",
-                        json={"template": "{{ label_entities('MCPServer') | list | tojson }}"},
-                    )
-                    template_response.raise_for_status()
+                # Optionally fetch allowed entity IDs via label filter
+                allowed_entity_ids: set[str] | None = None
+                if _MCP_LABEL:
+                    logger.debug(f"Fetching {_MCP_LABEL}-labeled entity IDs via template")
+                    async with self._semaphore:
+                        template_response = await self.client.post(
+                            "/template",
+                            json={"template": f"{{{{ label_entities('{_MCP_LABEL}') | list | tojson }}}}"},
+                        )
+                        template_response.raise_for_status()
 
-                allowed_entity_ids = set(json.loads(template_response.text))
-                logger.debug(f"Found {len(allowed_entity_ids)} MCPServer-labeled entities")
+                    allowed_entity_ids = set(json.loads(template_response.text))
+                    logger.debug(f"Found {len(allowed_entity_ids)} {_MCP_LABEL}-labeled entities")
 
-                # Fetch all states then keep only the allowed ones
+                # Fetch all states
                 logger.debug("Fetching all entity states from API")
                 async with self._semaphore:
                     response = await self.client.get("/states")
                     response.raise_for_status()
 
-                all_states = [
-                    state for state in response.json()
-                    if state.get("entity_id") in allowed_entity_ids
-                ]
-                logger.debug(f"Filtered to {len(all_states)} MCPServer-labeled entity states")
+                raw_states = response.json()
+                if allowed_entity_ids is not None:
+                    all_states = [
+                        state for state in raw_states
+                        if state.get("entity_id") in allowed_entity_ids
+                    ]
+                    logger.debug(f"Filtered to {len(all_states)} {_MCP_LABEL}-labeled entity states")
+                else:
+                    all_states = raw_states
+                    logger.debug(f"Retrieved {len(all_states)} entity states from API")
 
                 # Cache the filtered results
                 self.cache.set(cache_key, all_states, self.cache_ttl_states)
@@ -528,6 +595,22 @@ class HomeAssistantClient:
 
         return filtered_states  # type: ignore[no-any-return]
 
+    async def _assert_entity_label_allowed(self, entity_id: str) -> None:
+        """Raise EntityNotFoundError if entity does not carry the required label."""
+        if not _MCP_LABEL:
+            return
+        async with self._semaphore:
+            response = await self.client.post(
+                "/template",
+                json={"template": f"{{{{ '{entity_id}' in label_entities('{_MCP_LABEL}') }}}}"},
+            )
+            response.raise_for_status()
+        if response.text.strip() != "True":
+            logger.warning(f"Entity '{entity_id}' does not have label '{_MCP_LABEL}'")
+            raise EntityNotFoundError(
+                f"Entity '{entity_id}' not found in Home Assistant"
+            )
+
     async def get_state(self, entity_id: str) -> dict[str, Any]:
         """Get the state of a specific entity with caching.
 
@@ -562,6 +645,7 @@ class HomeAssistantClient:
         success = False
 
         try:
+            await self._assert_entity_label_allowed(entity_id)
             logger.debug(f"Fetching state for entity from API: {entity_id}")
             async with self._semaphore:
                 response = await self.client.get(f"/states/{entity_id}")
@@ -628,6 +712,7 @@ class HomeAssistantClient:
         success = False
 
         try:
+            await self._assert_entity_label_allowed(entity_id)
             payload = {
                 "state": state,
                 "attributes": attributes or {},
@@ -685,8 +770,8 @@ class HomeAssistantClient:
             ConnectionError: If connection to Home Assistant fails
             ServiceCallError: If the API returns an error
         """
-        # Don't allow delete
-        return {"message": "State not deleted"}
+        if not _ALLOW_STATE_DELETE:
+            return {"message": "State not deleted"}
 
         start_time = time.time()
         success = False
